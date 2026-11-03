@@ -27,4 +27,9 @@ class DirectorRules(unittest.TestCase):
         text=(ROOT/'references/aspect_ratio_profiles.md').read_text()
         for token in ['## 9:16','## 16:9','不继承竖屏单脸约束','单脸','15/30秒','两画幅 × 两时长 × 两输出格式']:
             self.assertIn(token,text)
+    def test_ai_execution_rules(self):
+        text=(ROOT/'references/ai_video_execution.md').read_text()
+        for token in ['@医生','@沈茉莉面部特写','原对白','独立生成段','声音连续','主动摄影机调度','不设置移动镜头百分比']:
+            self.assertIn(token,text)
+        self.assertIn('references/ai_video_execution.md',(ROOT/'SKILL.md').read_text())
 if __name__=='__main__': unittest.main()

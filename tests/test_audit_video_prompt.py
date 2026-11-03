@@ -48,6 +48,31 @@ class AuditorTests(unittest.TestCase):
         self.assertNotEqual(code, 0, output)
         self.assertIn(reason, output)
 
+    def test_explicit_identity_role_tag(self):
+        text = fixture().replace('@苏禾', '@医生')
+        self.assert_pass(text, extra=['-StrictCharacterReferences'])
+        self.assert_fail(text.replace('近景，@医生', '近景，医生', 1), 'CHARACTER_TAG_MISSING', extra=['-StrictCharacterReferences'])
+
+    def test_subject_binding_and_quote_exemption(self):
+        text = fixture().replace('近景，@苏禾', '@苏禾面部特写，@苏禾')
+        self.assert_pass(text + '\n', extra=['-StrictCharacterReferences'])
+        self.assert_fail(text.replace('@苏禾面部特写', '面部特写', 1), 'SHOT_SUBJECT_UNBOUND', extra=['-StrictCharacterReferences'])
+        text = text.replace('固定镜头。', '固定镜头，@苏禾「苏禾，走吧。」', 1)
+        self.assert_pass(text, extra=['-StrictCharacterReferences'])
+
+    def test_segment_same_subject_warns_not_fails(self):
+        one = fixture().replace('近景，@苏禾', '@苏禾面部特写，@苏禾')
+        code, output = self.audit(one + one.replace('17-S01', '17-S02'))
+        self.assertEqual(code, 0, output)
+        self.assertIn('SEGMENT_SEAM_SAME_SUBJECT', output)
+
+    def test_continuous_dialogue_audio_span(self):
+        text = fixture().replace('固定镜头。', '固定镜头。对白音轨：0-10秒。@苏禾「' + '长' * 40 + '」', 1)
+        code, output = self.audit(text)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn('Dialogue rate above', output)
+        self.assert_fail(text.replace('对白音轨：0-10秒', '对白音轨：0-20秒'), 'DIALOGUE_AUDIO_SPAN_INVALID')
+
     def test_independent_matrix(self):
         for ratio in ('9:16', '16:9'):
             for seconds in (15, 30):

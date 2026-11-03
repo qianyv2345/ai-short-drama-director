@@ -25,7 +25,9 @@
     [string]$AspectRatio,
 
     [ValidateSet('Auto', 'Compact', 'Detailed')]
-    [string]$OutputFormat = 'Auto'
+    [string]$OutputFormat = 'Auto',
+
+    [switch]$StrictCharacterReferences
 )
 
 $ErrorActionPreference = 'Stop'
@@ -373,6 +375,50 @@ for ($i = 0; $i -lt $shotMatches.Count; $i++) {
     }
 }
 
+
+# Explicit character binding checks. This is not visual recognition.
+$knownRoles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+foreach ($section in [regex]::Matches($prompt, '(?ms)^【人物】(?<body>.*?)(?=^【|^#{2,3}\s|\z)')) {
+    foreach ($role in [regex]::Matches($section.Groups['body'].Value, '(?m)^\s*@?(?<name>[\p{IsCJKUnifiedIdeographs}A-Za-z][\p{IsCJKUnifiedIdeographs}A-Za-z0-9]{0,11})(?:[（(][^\r\n）)]*[）)])?[：:]')) {
+        [void]$knownRoles.Add($role.Groups['name'].Value)
+    }
+}
+function Report-CharacterIssue([string]$Message) {
+    if ($StrictCharacterReferences) { Add-Failure $Message } else { Add-Warning $Message }
+}
+$previousVisual = $null
+$previousSegment = $null
+for ($i = 0; $i -lt $shotRecords.Count; $i++) {
+    $record = $shotRecords[$i]
+    $m = $record.Match
+    $end = $prompt.Length
+    if ($i + 1 -lt $shotRecords.Count) { $end = $shotRecords[$i + 1].Match.Index }
+    foreach ($section in [regex]::Matches($prompt, '(?m)^【音效】|^【连续性限制】|^#{2,3}\s')) {
+        if ($section.Index -gt $m.Index -and $section.Index -lt $end) { $end = $section.Index }
+    }
+    $body = $prompt.Substring($m.Index, $end - $m.Index)
+    # Original quoted dialogue is immutable, including names inside speech.
+    $visible = [regex]::Replace($body, '「[^」]*」|“[^”]*”', '')
+    foreach ($role in $knownRoles) {
+        if ($visible -match ('(?<!@)' + [regex]::Escape($role))) {
+            Report-CharacterIssue "CHARACTER_TAG_MISSING: $role in $($record.BaseId)."
+        }
+    }
+    $head = [regex]::Replace($visible, '^.*?秒[：:｜]\s*', '')
+    $head = [regex]::Replace($head, '^\d+-\d+[A-Z]*[｜；;]\s*', '')
+    $firstClause = ($head -split '[，。\r\n]')[0]
+    if ($firstClause -match '面部特写|眼神特写|单人.*景|孩子.*景|医生.*景' -and $firstClause -notmatch '@') {
+        Report-CharacterIssue "SHOT_SUBJECT_UNBOUND: $($record.BaseId) must bind its character in the shot description."
+    }
+    # Only explicit leading visual tags are comparable; never infer from speech.
+    $visual = [regex]::Match($firstClause, '@(?<name>[\p{IsCJKUnifiedIdeographs}A-Za-z0-9]+?)(?:面部|眼神|单人|近景|中景|特写|全景|右手|左手|，|\s|$)')
+    if ($record.SegmentId -ne $previousSegment -and $visual.Success -and $previousVisual -eq $visual.Groups['name'].Value) {
+        Add-Warning "SEGMENT_SEAM_SAME_SUBJECT: $($record.SegmentId) repeats $previousVisual; review viewpoint, state and generation seam manually."
+    }
+    $previousVisual = if ($visual.Success) { $visual.Groups['name'].Value } else { $null }
+    $previousSegment = $record.SegmentId
+}
+
 $canonicalPrefix = [regex]::Matches($prompt, '(?m)^整段视频默认无文字无字幕；剧本明确要求的剧情内文字除外。\s*$').Count
 $legacyPrefix = [regex]::Matches($prompt, '(?m)^整段视频无文字无字幕。\s*$').Count
 $prefixCount = $canonicalPrefix + $legacyPrefix
@@ -436,6 +482,16 @@ for ($index = 0; $index -lt $shotMatches.Count; $index++) {
         $spokenText = $spoken -join ''
         $hanCount = [regex]::Matches($spokenText, '[\p{IsCJKUnifiedIdeographs}]').Count
         $duration = [double]$match.Groups['end'].Value - [double]$match.Groups['start'].Value
+        $audioSpan = [regex]::Match($block, '对白音轨[：:]\s*(?<start>\d+(?:\.\d+)?)[-—–](?<end>\d+(?:\.\d+)?)秒')
+        if ($audioSpan.Success) {
+            $aStart = [double]$audioSpan.Groups['start'].Value
+            $aEnd = [double]$audioSpan.Groups['end'].Value
+            $owner = @($segmentMatches | Where-Object { $_.Index -lt $match.Index })[-1]
+            if ($aStart -lt 0 -or $aEnd -le $aStart -or $aEnd -gt [double]$owner.Groups['seconds'].Value -or -not (Test-HalfSecond $aStart) -or -not (Test-HalfSecond $aEnd)) {
+                Add-Failure 'DIALOGUE_AUDIO_SPAN_INVALID: Audio range must be inside its segment on the 0.5-second grid.'
+            }
+            $duration = $aEnd - $aStart
+        }
         if ($duration -gt 0) {
             $rate = $hanCount / $duration
             if ($rate -gt 6.0) {
