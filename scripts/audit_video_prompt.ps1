@@ -22,7 +22,10 @@
 
     [Parameter(Mandatory = $true)]
     [ValidateSet('9:16', '16:9')]
-    [string]$AspectRatio
+    [string]$AspectRatio,
+
+    [ValidateSet('Auto', 'Compact', 'Detailed')]
+    [string]$OutputFormat = 'Auto'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -112,10 +115,56 @@ catch {
     exit 1
 }
 
+# Normalize the documented metadata-style segment header for parsing only.
+# Never rewrite the user's file or dialogue. Both old and new exports stay readable.
+$metadataSegmentPattern = '(?ms)^##\s+生成段编号\s*\r?\n\s*(?<id>\d+-S\d+[A-Z]*)\s*\r?\n(?<meta>.*?)^##\s+总时长\s*\r?\n\s*(?<seconds>\d+(?:\.\d+)?)秒'
+$prompt = [regex]::Replace($prompt, $metadataSegmentPattern, {
+    param($m)
+    "## $($m.Groups['id'].Value)｜$($m.Groups['seconds'].Value)秒`n" + $m.Groups['meta'].Value
+})
+
 $segmentPattern = '(?m)^#{2,3}\s+(?<id>\d+-S\d+[A-Z]*).*?｜(?<seconds>\d+(?:\.\d+)?)秒\s*$'
-$shotPattern = '(?m)^\*\*(?<start>\d+(?:\.\d+)?)-(?<end>\d+(?:\.\d+)?)秒｜(?<id>[^*]+?)\*\*\s*$'
+# Compact rows are recognized only inside the unique timeline block below.
+$shotPattern = '(?m)^\*\*(?<start>\d+(?:\.\d+)?)-(?<end>\d+(?:\.\d+)?)秒｜(?<id>[^*]+?)\*\*[ \t]*\r?$'
 $segmentMatches = [regex]::Matches($prompt, $segmentPattern)
-$shotMatches = [regex]::Matches($prompt, $shotPattern)
+$parsedShots = [System.Collections.Generic.List[object]]::new()
+foreach ($m in [regex]::Matches($prompt, $shotPattern)) { $parsedShots.Add($m) }
+$compactPattern = '(?m)^(?<start>\d+(?:\.\d+)?)-(?<end>\d+(?:\.\d+)?)秒[：:](?<body>[^\r\n]+)'
+$timelineBlocks = [regex]::Matches($prompt, '(?ms)^【镜头时间轴】[^\r\n]*\r?\n(?<body>.*?)(?=^【|^#{1,3}\s|\z)')
+foreach ($timeline in $timelineBlocks) {
+    foreach ($m in [regex]::Matches($prompt, $compactPattern)) {
+        if ($m.Index -ge $timeline.Groups['body'].Index -and $m.Index -lt ($timeline.Groups['body'].Index + $timeline.Groups['body'].Length)) {
+            $parsedShots.Add($m)
+        }
+    }
+}
+$shotMatches = @($parsedShots | Sort-Object Index)
+# A numbered bold heading may wrap compact prose too (existing exports use it).
+# Presence of any canonical field label identifies a detailed block in Auto mode.
+$detailedIndices = [System.Collections.Generic.HashSet[int]]::new()
+for ($i = 0; $i -lt $shotMatches.Count; $i++) {
+    $m = $shotMatches[$i]
+    $end = $prompt.Length
+    if ($i + 1 -lt $shotMatches.Count) { $end = $shotMatches[$i + 1].Index }
+    foreach ($segment in $segmentMatches) { if ($segment.Index -gt $m.Index -and $segment.Index -lt $end) { $end = $segment.Index } }
+    $body = $prompt.Substring($m.Index + $m.Length, $end - $m.Index - $m.Length)
+    if ($body -match '(?m)^(整体画面|绝对主体与物理动势|环境场与情绪光影|摄影机调度|时间轴与状态演变|美学介质与底层渲染)：') {
+        $null = $detailedIndices.Add($m.Index)
+    }
+    elseif (-not $m.Groups['body'].Success -and ($body.Trim().Length -eq 0 -or $body.TrimStart().StartsWith('【'))) {
+        Add-Failure "EMPTY_SHOT: No shot description follows $($m.Value)."
+    }
+}
+$detailedCount = $detailedIndices.Count
+$compactCount = $shotMatches.Count - $detailedCount
+if ($OutputFormat -eq 'Compact' -and $detailedCount -gt 0) { Add-Failure 'OUTPUT_FORMAT: Detailed shots found in Compact mode.' }
+if ($OutputFormat -eq 'Detailed' -and $compactCount -gt 0) { Add-Failure 'OUTPUT_FORMAT: Compact shots found in Detailed mode.' }
+
+$aspectDeclarations = [regex]::Matches($prompt, '(?m)^(?:画面比例|画幅|比例)[：:]\s*(?<ratio>9:16|16:9)\s*$')
+if ($aspectDeclarations.Count -eq 0) { Add-Warning 'ASPECT_RATIO_UNDECLARED: Review the selected ratio against the actual composition.' }
+foreach ($a in $aspectDeclarations) {
+    if ($a.Groups['ratio'].Value -ne $AspectRatio) { Add-Failure "ASPECT_RATIO_MISMATCH: Declared $($a.Groups['ratio'].Value), selected $AspectRatio." }
+}
 
 if ($segmentMatches.Count -eq 0) {
     Add-Failure 'No generation segment headings found.'
@@ -194,6 +243,7 @@ for ($segmentIndex = 0; $segmentIndex -lt $segmentMatches.Count; $segmentIndex++
         $timeGranularityStatus = 'FAIL'
         Add-Failure "Generation segment $($segmentMatch.Groups['id'].Value) total must be written as an integer number of seconds: $secondsText"
     }
+    if ($seconds -le 0) { Add-Failure 'Generation segment duration must be positive.' }
     $segmentTotal += $seconds
     if ($seconds -gt $maxSegment) { $maxSegment = $seconds }
     if ($seconds -gt $MaxSegmentSeconds) {
@@ -220,6 +270,14 @@ for ($segmentIndex = 0; $segmentIndex -lt $segmentMatches.Count; $segmentIndex++
         $start = [double]$match.Groups['start'].Value
         $end = [double]$match.Groups['end'].Value
         $rawId = $match.Groups['id'].Value.Trim()
+        if ($match.Groups['body'].Success) {
+            $compactId = [regex]::Match($match.Groups['body'].Value, '(?:^|[；;]\s*)镜头编号[：:]\s*(?<id>\d+-\d+[A-Z]*)')
+            if ($compactId.Success) { $rawId = $compactId.Groups['id'].Value }
+            else {
+                $rawId = "$($segmentMatch.Groups['id'].Value)-compact-$($shotIndex + 1)"
+                if ($ExpectedAbsentShotId) { Add-Failure 'SHOT_ID_UNAVAILABLE: Compact rows need 镜头编号：集数-镜号； when ExpectedAbsentShotId is requested.' }
+            }
+        }
         $baseId = ($rawId -split '[｜（(]')[0].Trim()
         $shotDuration = $end - $start
         if (-not (Test-HalfSecond $start) -or -not (Test-HalfSecond $end) -or -not (Test-HalfSecond $shotDuration)) {
@@ -272,6 +330,10 @@ foreach ($soundSection in [regex]::Matches($prompt, $soundSectionPattern)) {
     }
 }
 
+if ($shotRecords.Count -ne $shotMatches.Count) { Add-Failure 'ORPHAN_SHOT: Timed shots found outside a generation segment.' }
+$duplicateSegments = $segmentMatches | ForEach-Object { $_.Groups['id'].Value } | Group-Object | Where-Object Count -gt 1
+foreach ($duplicate in $duplicateSegments) { Add-Failure "Duplicate segment id: $($duplicate.Name)" }
+
 $duplicateShots = $shotIds | Group-Object | Where-Object Count -gt 1
 foreach ($duplicate in $duplicateShots) {
     Add-Failure "Duplicate shot id: $($duplicate.Name)"
@@ -286,10 +348,28 @@ $requiredFields = @(
     '美学介质与底层渲染：'
 )
 
-foreach ($field in $requiredFields) {
-    $count = [regex]::Matches($prompt, "(?m)^$([regex]::Escape($field))").Count
-    if ($count -ne $shotMatches.Count) {
-        Add-Failure "Field count mismatch for $field expected $($shotMatches.Count), got $count."
+# Six fields belong only to detailed shots. Check each block rather than global
+# counts, so a missing field cannot be hidden by duplication in another shot.
+for ($i = 0; $i -lt $shotMatches.Count; $i++) {
+    $m = $shotMatches[$i]
+    $end = $prompt.Length
+    if ($i + 1 -lt $shotMatches.Count) { $end = $shotMatches[$i + 1].Index }
+    foreach ($segment in $segmentMatches) { if ($segment.Index -gt $m.Index -and $segment.Index -lt $end) { $end = $segment.Index } }
+    $block = $prompt.Substring($m.Index, $end - $m.Index)
+    if ($detailedIndices.Contains($m.Index) -or $OutputFormat -eq 'Detailed') {
+        foreach ($field in $requiredFields) {
+            $count = [regex]::Matches($block, "(?m)^$([regex]::Escape($field))").Count
+            if ($count -ne 1) { Add-Failure "Field count mismatch in $($m.Groups['id'].Value) for $field expected 1, got $count." }
+        }
+    }
+    # A text auditor cannot infer all faces reliably. Explicit counts can be
+    # enforced; natural-language composition and generation still need review.
+    if ($AspectRatio -eq '9:16') {
+        $faceCount = [regex]::Match($block, '清晰人脸数量[：:]\s*(?<count>\d+)')
+        $hasWideShot = $block -match '(?<!非|不|中|近)全景|大全景|远景'
+        if ($faceCount.Success -and [int]$faceCount.Groups['count'].Value -gt 1 -and -not $hasWideShot) {
+            Add-Failure "PORTRAIT_FACE_COUNT: More than one clear face declared in non-wide shot at $($m.Groups['start'].Value)s."
+        }
     }
 }
 
@@ -310,14 +390,26 @@ if ($prompt.Contains('`r`n')) {
 $executionLines = $prompt -split "`r?`n" | Where-Object {
     $_ -match '^(整体画面：|绝对主体与物理动势：|环境场与情绪光影：|摄影机调度：|时间轴与状态演变：|美学介质与底层渲染：)'
 }
-$relativePattern = '承接上一镜|保持上一段状态|同上|位置不变|继续前一动作|供下一段续接'
+$executionLines = @($executionLines) + @($shotMatches | Where-Object { $_.Groups['body'].Success } | ForEach-Object { $_.Groups['body'].Value })
+for ($i = 0; $i -lt $shotMatches.Count; $i++) {
+    $m = $shotMatches[$i]
+    if ($m.Groups['body'].Success -or $detailedIndices.Contains($m.Index)) { continue }
+    $end = $prompt.Length
+    if ($i + 1 -lt $shotMatches.Count) { $end = $shotMatches[$i + 1].Index }
+    foreach ($section in [regex]::Matches($prompt, '(?m)^【|^#{2,3}\s')) {
+        if ($section.Index -gt $m.Index -and $section.Index -lt $end) { $end = $section.Index }
+    }
+    $executionLines += $prompt.Substring($m.Index + $m.Length, $end - $m.Index - $m.Length)
+}
+$executionLines = $executionLines | Where-Object { $_ }
+$relativePattern = '承接上一镜|保持上一段状态|同上|沿用上一镜位置|继续前一动作|供下一段续接'
 foreach ($line in $executionLines) {
     if ($line -match $relativePattern) {
         Add-Failure "Relative continuity instruction found: $line"
     }
 }
 
-$cameraLines = $executionLines | Where-Object { $_ -match '^摄影机调度：' }
+$cameraLines = $executionLines | Where-Object { $_ -match '^摄影机调度：|过肩|肩后' }
 foreach ($line in $cameraLines) {
     $mentionsOverShoulder = ($line -match '过肩|肩后')
     $explicitlyNoOverShoulder = ($line -match '不设置.*过肩|无肩前景|不设置前景过肩')
@@ -334,6 +426,9 @@ for ($index = 0; $index -lt $shotMatches.Count; $index++) {
     }
     else {
         $blockLength = $prompt.Length - $blockStart
+    }
+    foreach ($segment in $segmentMatches) {
+        if ($segment.Index -gt $blockStart -and $segment.Index -lt ($blockStart + $blockLength)) { $blockLength = $segment.Index - $blockStart }
     }
     $block = $prompt.Substring($blockStart, $blockLength)
     $spoken = [regex]::Matches($block, '「([^」]+)」') | ForEach-Object { $_.Groups[1].Value }
@@ -437,6 +532,7 @@ if ($entityBaselineText -or $ExpectedEntity) {
 }
 
 Write-Output "SEGMENTS=$($segmentMatches.Count) MAX_SEGMENT=$maxSegment SELECTED_MAX=$MaxSegmentSeconds ASPECT_RATIO=$AspectRatio TOTAL=$segmentTotal"
+Write-Output "FORMAT=$OutputFormat COMPACT_SHOTS=$compactCount DETAILED_SHOTS=$detailedCount ASPECT_SEMANTICS=MANUAL_REVIEW_REQUIRED"
 Write-Output "SHOTS=$($shotMatches.Count) TIMELINE_TOTAL=$timelineTotal PREFIXES=$prefixCount CANONICAL_PREFIXES=$canonicalPrefix LEGACY_PREFIXES=$legacyPrefix TIME_GRANULARITY=$timeGranularityStatus ENTITY_AUDIT=$entityAuditStatus TEXT_STATE=$textStateStatus LIGHTING_LAYERS=$lightingLayerStatus STYLE_PHYSICAL=$stylePhysicalStatus"
 
 foreach ($warning in $warnings) {
@@ -452,3 +548,4 @@ if ($failures.Count -gt 0) {
 
 Write-Output "PASS warnings=$($warnings.Count)"
 exit 0
+
